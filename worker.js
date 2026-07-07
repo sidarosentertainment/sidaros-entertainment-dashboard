@@ -155,6 +155,21 @@ const ADAPTERS = {
     configured: true,
     auth: 'token', /* pasted personal access token, secret POS_API_TOKEN */
     oauth: {},
+    /* Historical backfill from the old POS provider (before Square): a
+       simple "YYYY-MM-DD,count" text upload, ingested via /api/ingest and
+       stored in the day-store. fetchRange/fetchMonthly below check the
+       day-store FIRST and only fall back to a live Square call when no
+       backfilled rows exist for that range - so recent (live) months are
+       never shadowed by old backfilled numbers. */
+    async parseExport(env, h, raw) {
+      const rows = [];
+      const lines = String((raw && raw.text) || '').split(/\r?\n/);
+      for (const line of lines) {
+        const m = /^\s*(\d{4}-\d{2}-\d{2})\s*,\s*(\d+(?:\.\d+)?)\s*$/.exec(line);
+        if (m) rows.push({ date: m[1], count: parseFloat(m[2]) });
+      }
+      return rows;
+    },
     async status(env, h) {
       if (!env.POS_API_TOKEN) return { connected: false };
       const base = await squareBase(env, h);
@@ -173,6 +188,8 @@ const ADAPTERS = {
       }
     },
     async fetchRange(env, h, q) {
+      const ing = await h.readIngested(q.from, q.to);
+      if (ing.daysWithData > 0) return { count: ing.sums.count || 0 };
       const base = await squareBase(env, h);
       if (!base) { const e = new Error('no square connection'); e.status = 401; throw e; }
       return { count: await squareCountPayments(env, base, q.from, q.to, q.tz, q.rollover) };
@@ -180,7 +197,6 @@ const ADAPTERS = {
     async fetchMonthly(env, h, q) {
       const months = monthList(q.fromMonth, q.toMonth);
       const base = await squareBase(env, h);
-      if (!base) return { months, count: months.map(() => null) };
       const out = { months, count: [] };
       for (const mo of months) {
         const [y, m] = mo.split('-').map(Number);
@@ -188,6 +204,9 @@ const ADAPTERS = {
         const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
         const to = mo + '-' + String(lastDay).padStart(2, '0');
         try {
+          const ing = await h.readIngested(from, to);
+          if (ing.daysWithData > 0) { out.count.push(ing.sums.count || 0); continue; }
+          if (!base) { out.count.push(null); continue; }
           out.count.push(await squareCountPayments(env, base, from, to, q.tz, q.rollover));
         } catch (e) {
           out.count.push(null);
@@ -205,6 +224,19 @@ const ADAPTERS = {
      If this source is gated or absent, leave configured:false - the actual
      Wage % from accounting already covers the board (fallback ladder).
      Example (Deputy): pasted permanent token (secret ROSTERING_API_TOKEN).
+  */
+  /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
+     Contract:
+       status(env, h)        -> { connected, org, sandbox, lastSync }
+       fetchRange(env, h, q) -> { cost }    (rostered labour cost for the
+                                  period; powers the PROJECTED wage % only)
+     If this source is gated or absent, leave configured:false - the actual
+     Wage % from accounting already covers the board (fallback ladder).
+     Example (Deputy): OAuth2 (client-credentials-style setup at the
+     install's own /exec/devapp/oauth_clients page) - not wired yet: the
+     refresh step uses a different per-install endpoint than the initial
+     exchange, which needs custom handling beyond this shell's generic OAuth
+     helper. Revisit if the owner wants the Projected Wage % card.
   */
   rostering: {
     configured: false,
